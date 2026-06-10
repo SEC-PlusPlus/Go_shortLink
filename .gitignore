@@ -13,5 +13,6 @@ bin/
 .DS_Store
 Thumbs.db
 
-# Go
-go.sum
+# Go build artifacts
+*.test
+*.out
