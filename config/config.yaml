@@ -1,0 +1,32 @@
+server:
+  port: 8080
+  mode: debug
+
+mysql:
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  password: "123456"
+  dbname: shorturl
+  max_open_conns: 100
+  max_idle_conns: 10
+
+redis:
+  addr: 127.0.0.1:6379
+  password: ""
+  db: 0
+  pool_size: 50
+
+shortlink:
+  default_expire_days: 30
+  redis_cache_ttl: 3600
+  bloom_filter:
+    use_redis: false
+    redis_key: "bloom:shortcodes"
+    error_rate: 0.001
+    capacity: 1000000
+  id_counter_key: "short:id:counter"
+
+log:
+  level: info
+  format: json

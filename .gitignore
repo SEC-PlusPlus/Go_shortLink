@@ -1,0 +1,17 @@
+# Claude Code internal folder
+.claude/
+
+# Build output
+bin/
+*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+go.sum
