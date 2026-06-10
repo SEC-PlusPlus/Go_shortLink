@@ -1,3 +1,11 @@
+// Package service 是短链接服务的核心业务逻辑层。
+// 负责编排 Redis 缓存、MySQL 数据库、布隆过滤器、Base62 编码之间的调用流程。
+//
+// 核心设计：
+//   1. 缓存策略：Cache-Aside（旁路缓存）— 查询先 Redis 后 MySQL，写入同时更新两层
+//   2. 防击穿：singleflight — 同一短码的并发请求合并为一次数据库查询
+//   3. 防穿透：布隆过滤器 — 快速否决不存在的短码，避免无效请求打到数据库
+//   4. 发号器：Redis INCR — 原子自增生成唯一 ID，Base62 编码为短码
 package service
 
 import (
@@ -18,18 +26,19 @@ import (
 	"gorm.io/gorm"
 )
 
-// ShortLinkService handles all business logic for short link operations.
-// It orchestrates between Redis cache, MySQL database, base62 encoding, and bloom filter.
+// ShortLinkService 是短链业务逻辑的核心结构体。
+// 持有所有外部依赖的引用，通过依赖注入在 main() 中初始化。
 type ShortLinkService struct {
-	dao    *dao.ShortLinkDAO
-	rdb    *redis.Client
-	bloom  *bloom.Filter
-	cfg    *config.ShortLinkConfig
-	logger *zap.Logger
-	sg     singleflight.Group
+	dao    *dao.ShortLinkDAO        // 数据库操作
+	rdb    *redis.Client            // Redis 客户端（缓存 + 发号器）
+	bloom  *bloom.Filter            // 布隆过滤器（防穿透）
+	cfg    *config.ShortLinkConfig  // 短链相关配置
+	logger *zap.Logger              // 结构化日志
+	sg     singleflight.Group       // 请求合并组（防击穿）
 }
 
-// NewShortLinkService creates a new ShortLinkService with all dependencies.
+// NewShortLinkService 构造函数，通过依赖注入组装 Service。
+// 调用者：main() — 唯一的组装点
 func NewShortLinkService(
 	dao *dao.ShortLinkDAO,
 	rdb *redis.Client,
@@ -46,54 +55,75 @@ func NewShortLinkService(
 	}
 }
 
-// ShortenRequest is the input for creating a short link.
+// ShortenRequest 是短链生成请求的数据传输对象（DTO）。
+// validator tag 用于 Gin 的参数校验。
 type ShortenRequest struct {
-	OriginalURL string `json:"original_url" validate:"required,url"`
-	CustomCode  string `json:"custom_code" validate:"omitempty,min=4,max=10,alphanum"`
-	ExpireDays  int    `json:"expire_days" validate:"omitempty,min=0,max=3650"`
+	OriginalURL string `json:"original_url" validate:"required,url"`                  // 原始长 URL，必填，需为合法 URL
+	CustomCode  string `json:"custom_code" validate:"omitempty,min=4,max=10,alphanum"` // 自定义短码，可选，4-10位字母数字
+	ExpireDays  int    `json:"expire_days" validate:"omitempty,min=0,max=3650"`       // 过期天数，0=使用默认，负值=永久
 }
 
-// ShortenResponse is the output of a successful short link creation.
+// ShortenResponse 是短链生成成功后的响应 DTO。
 type ShortenResponse struct {
-	ShortURL string     `json:"short_url"`
-	ShortCode string    `json:"short_code"`
-	ExpireAt  *time.Time `json:"expire_at,omitempty"`
+	ShortURL  string     `json:"short_url"`           // 完整短链 URL（如 http://localhost:8080/abc123）
+	ShortCode string     `json:"short_code"`          // 短码
+	ExpireAt  *time.Time `json:"expire_at,omitempty"` // 过期时间，null 表示永久
 }
 
-// RedirectResult holds the data needed to perform an HTTP redirect.
+// RedirectResult 是重定向查找的结果。
+// IsPermanent 决定 HTTP 状态码：true→301，false→302。
 type RedirectResult struct {
-	OriginalURL string
-	IsPermanent bool // true → 301, false → 302
+	OriginalURL string // 原始长 URL
+	IsPermanent bool   // true=301 永久重定向，false=302 临时重定向
 }
 
-// Shorten creates a short link from the given request.
+// Shorten 创建短链接（核心方法）。
 //
-// Flow:
-// 1. If custom_code is provided, check for conflicts in Redis and MySQL.
-// 2. If no custom_code, call Redis INCR on the ID counter and encode it with base62.
-// 3. Calculate expire_at from expire_days (0 = permanent, nil for permanent).
-// 4. Insert the record into MySQL via DAO.
-// 5. Cache the mapping in Redis with TTL.
-// 6. Add the short code to the bloom filter.
+// 完整业务流程：
+//
+//   1. 确定短码来源
+//      ├─ 用户提供了 custom_code
+//      │    ├─ base62.IsValid() → 校验字符集是否合法
+//      │    ├─ Redis EXISTS → 检查缓存中是否已存在
+//      │    ├─ DAO.ExistsByShortCode() → 检查数据库中是否已存在
+//      │    └─ 无冲突 → 直接使用该 custom_code
+//      │
+//      └─ 用户未提供 custom_code
+//           ├─ Redis INCR id_counter → 原子自增获取唯一数字 ID
+//           └─ base62.Encode(id) → 将数字编码为短码
+//
+//   2. 计算过期时间
+//      ├─ ExpireDays > 0 → now + N days
+//      ├─ ExpireDays = 0 → 使用配置的默认过期天数
+//      └─ ExpireDays < 0 → nil（永久有效）
+//
+//   3. DAO.Create() → 写入 MySQL（唯一索引保证短码唯一）
+//   4. Redis SET → 将映射写入缓存（TTL 与过期时间对齐）
+//   5. bloom.Add() → 将短码加入布隆过滤器
+//   6. 记录日志 → 返回 ShortenResponse
 func (s *ShortLinkService) Shorten(ctx context.Context, req *ShortenRequest) (*ShortenResponse, error) {
 	var code string
 
+	// ── 第1步：确定短码 ──────────────────────────────────
 	if req.CustomCode != "" {
-		// Validate base62 charset
+		// 用户自定义短码
+
+		// 校验字符集必须在 Base62 范围内
 		if !base62.IsValid(req.CustomCode) {
 			return nil, fmt.Errorf("custom_code contains invalid characters")
 		}
 
-		// Check Redis cache first
+		// 先查 Redis 缓存（快速路径）
 		exists, err := s.rdb.Exists(ctx, s.cacheKey(req.CustomCode)).Result()
 		if err != nil {
+			// Redis 异常不阻塞业务，记录日志后继续查数据库
 			s.logger.Error("redis check failed", zap.Error(err))
 		}
 		if exists > 0 {
 			return nil, fmt.Errorf("short code already in use: %s", req.CustomCode)
 		}
 
-		// Check MySQL
+		// 再查 MySQL（包括已过期/已删除记录，防止重复使用）
 		dbExists, err := s.dao.ExistsByShortCode(ctx, req.CustomCode)
 		if err != nil {
 			s.logger.Error("db check failed", zap.Error(err))
@@ -105,7 +135,7 @@ func (s *ShortLinkService) Shorten(ctx context.Context, req *ShortenRequest) (*S
 
 		code = req.CustomCode
 	} else {
-		// Generate from auto-increment counter via Redis INCR
+		// 自动生成短码：Redis INCR 发号器 + Base62 编码
 		id, err := s.rdb.Incr(ctx, s.cfg.IDCounterKey).Result()
 		if err != nil {
 			s.logger.Error("redis incr failed", zap.Error(err))
@@ -114,19 +144,19 @@ func (s *ShortLinkService) Shorten(ctx context.Context, req *ShortenRequest) (*S
 		code = base62.Encode(uint64(id))
 	}
 
-	// Calculate expiration
+	// ── 第2步：计算过期时间 ──────────────────────────────
 	var expireAt *time.Time
 	expireDays := req.ExpireDays
 	if expireDays == 0 {
-		expireDays = s.cfg.DefaultExpireDays
+		expireDays = s.cfg.DefaultExpireDays // 使用配置的默认值（30天）
 	}
 	if expireDays > 0 {
 		t := time.Now().Add(time.Duration(expireDays) * 24 * time.Hour)
 		expireAt = &t
 	}
-	// expireDays == -1 means permanent (if we wanted to support that explicitly)
+	// expireDays < 0 时 expireAt 保持 nil → 永久有效
 
-	// Create database record
+	// ── 第3步：写入数据库 ────────────────────────────────
 	link := &model.ShortLink{
 		ShortCode:   code,
 		OriginalURL: req.OriginalURL,
@@ -137,43 +167,51 @@ func (s *ShortLinkService) Shorten(ctx context.Context, req *ShortenRequest) (*S
 		return nil, fmt.Errorf("failed to create short link: %w", err)
 	}
 
-	// Cache in Redis
+	// ── 第4步：写入 Redis 缓存 ───────────────────────────
+	// 缓存失败不阻塞业务（重定向时回源查数据库即可）
 	cacheTTL := s.cacheTTL(expireAt)
 	if err := s.rdb.Set(ctx, s.cacheKey(code), req.OriginalURL, cacheTTL).Err(); err != nil {
 		s.logger.Warn("failed to cache in redis", zap.String("code", code), zap.Error(err))
-		// Non-fatal: continue (redirect will fall back to DB)
 	}
 
-	// Update bloom filter
+	// ── 第5步：更新布隆过滤器 ────────────────────────────
 	s.bloom.Add(code)
 
+	// ── 第6步：记录日志并返回 ────────────────────────────
 	s.logger.Info("short link created",
 		zap.String("code", code),
 		zap.String("original_url", req.OriginalURL),
 	)
 
 	return &ShortenResponse{
-		ShortURL:  code, // handler will prepend domain
+		ShortURL:  code, // 完整 URL 由 Handler 层拼接 baseURL
 		ShortCode: code,
 		ExpireAt:  expireAt,
 	}, nil
 }
 
-// Redirect looks up the original URL for a short code and returns redirect info.
+// Redirect 执行重定向查找（核心方法）。
 //
-// Flow:
-// 1. Check bloom filter — if the code is definitely absent, return not-found immediately.
-// 2. Use singleflight to merge concurrent lookups for the same code.
-// 3. Check Redis cache; on hit, return the original URL.
-// 4. On miss, query MySQL; if found and not expired, cache in Redis, then return.
-// 5. If not found or expired, return appropriate error.
+// 防护策略：
+//
+//   1. 防穿透：布隆过滤器快速否决
+//      └─ bloom.Test(code) == false → 直接返回 ErrNotFound，无需查数据库
+//
+//   2. 防击穿：singleflight 请求合并
+//      └─ 同一短码的并发请求合并为一次 lookup() 调用
+//         例：1000 个并发请求 /abc123 → 只产生 1 次数据库查询
+//
+//   3. 缓存加速：Cache-Aside 策略
+//      └─ Redis 命中 → 直接返回（无需查数据库）
+//      └─ Redis 未命中 → 查 MySQL → 回写 Redis → 返回
 func (s *ShortLinkService) Redirect(ctx context.Context, code string) (*RedirectResult, error) {
-	// Step 1: Bloom filter check (fast reject)
+	// 第1步：布隆过滤器快速否决（内存操作，微秒级）
 	if !s.bloom.Test(code) {
-		return nil, ErrNotFound
+		return nil, ErrNotFound // 绝对不存在，直接返回
 	}
 
-	// Step 2-5: Singleflight-merged lookup
+	// 第2-5步：singleflight 包裹的查找逻辑
+	// 同一 code 的并发请求只会执行一次 lookup()，其他请求共享结果
 	val, err, _ := s.sg.Do(code, func() (interface{}, error) {
 		return s.lookup(ctx, code)
 	})
@@ -186,40 +224,45 @@ func (s *ShortLinkService) Redirect(ctx context.Context, code string) (*Redirect
 	return result, nil
 }
 
-// lookup performs the actual cache-then-DB resolution for a short code.
-// Called via singleflight to prevent cache stampede.
+// lookup 执行实际的缓存→数据库查询（被 singleflight 包裹）。
+// 方法为私有（小写开头），只通过 singleflight.Do() 间接调用。
+//
+// 查询顺序：Redis 缓存 → MySQL 数据库 → 回写 Redis
 func (s *ShortLinkService) lookup(ctx context.Context, code string) (*RedirectResult, error) {
-	// Step 3: Try Redis first
 	cacheKey := s.cacheKey(code)
+
+	// ── 第3步：尝试 Redis 缓存 ───────────────────────────
 	originalURL, err := s.rdb.Get(ctx, cacheKey).Result()
 	if err == nil {
-		// Cache hit
+		// 缓存命中，直接返回（最常见路径）
 		return &RedirectResult{
 			OriginalURL: originalURL,
-			IsPermanent: true, // default 301
+			IsPermanent: true, // 默认 301 永久重定向
 		}, nil
 	}
+	// redis.Nil 表示 key 不存在，属于正常情况，继续查数据库
+	// 其他错误（连接失败等）记录日志后也继续查数据库，降级处理
 	if !errors.Is(err, redis.Nil) {
-		// Redis error — log but continue to DB
 		s.logger.Warn("redis get error", zap.String("code", code), zap.Error(err))
 	}
 
-	// Step 4: Query MySQL
+	// ── 第4步：查询 MySQL 数据库 ─────────────────────────
 	link, err := s.dao.GetByShortCode(ctx, code)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrNotFound
+			return nil, ErrNotFound // 数据库中也无记录
 		}
 		s.logger.Error("db query error", zap.String("code", code), zap.Error(err))
 		return nil, fmt.Errorf("internal error")
 	}
 
-	// Check expiration
+	// ── 第5步：过期检查 ──────────────────────────────────
 	if link.IsExpired() {
-		return nil, ErrExpired
+		return nil, ErrExpired // 已过期
 	}
 
-	// Step 5: Write back to Redis
+	// ── 第6步：回写 Redis 缓存 ───────────────────────────
+	// 缓存回写失败不阻塞业务（下次请求重新查库即可）
 	cacheTTL := s.cacheTTL(link.ExpireAt)
 	if err := s.rdb.Set(ctx, cacheKey, link.OriginalURL, cacheTTL).Err(); err != nil {
 		s.logger.Warn("failed to cache in redis on lookup", zap.String("code", code), zap.Error(err))
@@ -231,43 +274,54 @@ func (s *ShortLinkService) lookup(ctx context.Context, code string) (*RedirectRe
 	}, nil
 }
 
-// cacheKey returns the Redis key for a short code cache entry.
+// cacheKey 生成 Redis 缓存 key。
+// 格式：shortlink:{code}
+// 示例：shortlink:abc123
 func (s *ShortLinkService) cacheKey(code string) string {
 	return "shortlink:" + code
 }
 
-// cacheTTL calculates the TTL for a cached short link.
-// If expireAt is nil (permanent), uses the configured default.
-// Otherwise, sets TTL to time remaining until expiration.
+// cacheTTL 计算缓存 TTL（过期时间）。
+//
+// 策略：
+//   expireAt == nil（永久）            → 使用配置的默认 TTL（如 3600 秒）
+//   剩余时间 > 配置 TTL                 → 封顶为配置 TTL（避免缓存过久）
+//   0 < 剩余时间 ≤ 配置 TTL            → 使用剩余时间（与数据过期同步）
+//   剩余时间 ≤ 0（已过期但未清理）       → 返回 1 秒（最小 TTL）
+//
+// 设计意图：缓存永远不比数据活得更久，避免返回已过期的重定向。
 func (s *ShortLinkService) cacheTTL(expireAt *time.Time) time.Duration {
 	if expireAt == nil {
-		// Permanent link — use configured default cache TTL
+		// 永久链接：使用默认 TTL，到期后自动刷新
 		return time.Duration(s.cfg.RedisCacheTTL) * time.Second
 	}
 	remaining := time.Until(*expireAt)
 	if remaining <= 0 {
-		return 1 * time.Second // minimum TTL for already-expired
+		return 1 * time.Second // 最小 TTL，避免负值
 	}
 	if remaining > time.Duration(s.cfg.RedisCacheTTL)*time.Second {
-		// Cap at configured max
+		// 剩余时间超过配置上限，封顶处理
 		return time.Duration(s.cfg.RedisCacheTTL) * time.Second
 	}
+	// TTL 与数据过期时间一致
 	return remaining
 }
 
-// RebuildBloomFilter rebuilds the bloom filter from the database.
-// Called during startup and periodically.
+// RebuildBloomFilter 代理方法，从数据库重建布隆过滤器。
+// 调用者：main() — 启动时调用一次
 func (s *ShortLinkService) RebuildBloomFilter(ctx context.Context) error {
 	return s.bloom.Rebuild(ctx, s.dao.GetAllActiveShortCodes)
 }
 
-// StartBloomRebuildLoop starts periodic bloom filter rebuilding.
+// StartBloomRebuildLoop 代理方法，启动布隆过滤器的定时重建协程。
+// 调用者：main() — 启动后台 goroutine
 func (s *ShortLinkService) StartBloomRebuildLoop(ctx context.Context, interval time.Duration) {
 	s.bloom.StartRebuildLoop(ctx, interval, s.dao.GetAllActiveShortCodes)
 }
 
-// Domain error sentinels
+// ── 领域错误哨兵值 ──────────────────────────────────────
+// Service 层返回这些错误，Handler 层通过 errors.Is() 判断并映射到 HTTP 状态码。
 var (
-	ErrNotFound = errors.New("short link not found")
-	ErrExpired  = errors.New("short link has expired")
+	ErrNotFound = errors.New("short link not found") // → 404
+	ErrExpired  = errors.New("short link has expired") // → 410
 )
